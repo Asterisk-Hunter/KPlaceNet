@@ -1,0 +1,13 @@
+# KPlaceNet L0 — 4050-safe dependencies
+# Install with: pip install -r requirements.txt
+# No training logic beyond stubs, no heavy deps beyond this list.
+
+torch
+torchvision
+scikit-learn
+huggingface_hub
+numpy
+pandas
+matplotlib
+Pillow
+tqdm
