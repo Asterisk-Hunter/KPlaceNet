@@ -9,13 +9,16 @@ data/
   README.md
   .gitkeep
   flickr_geo_tiny/
-    metadata.csv      # image_path,lat,lon  (5-10k debug, OOM checks)
+    metadata.csv      # image_path,lat,lon  (dummy smoke set, --dry-run)
     images/           # actual images (not committed)
   osv5m_subset_10k/
-    metadata.csv      # 10k stratified subset of OSV-5M (plan Sec 2)
+    metadata.csv      # image_path,lat,lon,id,split(+country/region if present) — OSV TRAIN split
+    images/
+  osv5m_test/
+    metadata.csv      # official OSV TEST split — eval-only, never train
     images/
   im2gps3k/
-    metadata.csv      # 3k eval-only, never train
+    metadata.csv      # 3k eval-only, never train (manual download)
     images/
 ```
 
@@ -25,14 +28,28 @@ data/
 # Smoke (no download) — 50 dummy images
 python scripts/download_subset.py --dataset flickr_geo_tiny --output-dir data/flickr_geo_tiny --max-samples 50 --dry-run
 
-# Real (requires huggingface_hub + HF token/approval where gated)
-python scripts/download_subset.py --dataset flickr_geo_tiny --output-dir data/flickr_geo_tiny
-python scripts/download_subset.py --dataset osv5m --output-dir data/osv5m_subset_10k --max-samples 10000
-python scripts/download_subset.py --dataset im2gps3k --output-dir data/im2gps3k
+# OSV-5M train subset — SAFE downloader. WARNING: repo osv5m/osv5m is ~259GB
+# in full; selected image shards are multi-GB. A token is optional for rate limits/resume.
+# The script NEVER snapshot-downloads; it fetches only listed shard zips
+# (images/train/NN.zip) + metadata, extracting only selected ids.
+# Step 1 — plan only (no network, no files). Step 2 — re-run with --yes.
+python scripts/download_subset.py --dataset osv5m --split train --output-dir data/osv5m_subset_10k --max-samples 10000 --plan-only
+python scripts/download_subset.py --dataset osv5m --split train --output-dir data/osv5m_subset_10k --max-samples 10000 --yes
+# Pin shards explicitly (otherwise sequential discovery from 00, up to --max-shards):
+python scripts/download_subset.py --dataset osv5m --split train --output-dir data/osv5m_subset_10k --shards 00,01 --yes
+
+# Official OSV test (eval-only, separate dir — never train on it):
+python scripts/download_subset.py --dataset osv5m --split test --output-dir data/osv5m_test --max-samples 3000 --plan-only
+python scripts/download_subset.py --dataset osv5m --split test --output-dir data/osv5m_test --max-samples 3000 --yes
+
+# IM2GPS3k — manual only: download from the authors, place images + metadata.csv
+# (header image_path,lat,lon) under data/im2gps3k/.
 ```
 
-- CSV format: header `image_path,lat,lon`. `image_path` may be absolute or relative to the CSV file.
-- OSV-5M train/test spatial separation (1km) is respected — never mix IM2GPS3k into train.
+- CSV format: header `image_path,lat,lon` plus `id,split` provenance (+country/region if the source has them). `image_path` may be absolute or relative to the CSV file.
+- OSV-5M train/test spatial separation (1km) is respected: train rows keep `split=train` and are NEVER re-split into eval; eval uses `--split test` output or IM2GPS3k.
+- Full train.csv (~2.92GB) is never fetched unless you pass the explicit opt-in `--allow-full-train-csv`; otherwise train rows are found by capped Range streaming (`--csv-scan-cap-mb`, default 512MB) and the script aborts honestly instead of silently downloading huge files.
+- Row counts are honest: if fewer than `--max-samples` are extracted the script says so and never claims '10k'.
 - Full OSV-5M (5.1M) / YFCC100M are **out of scope** for this plan.
 
 ## .gitignore

@@ -27,7 +27,8 @@ python -c "import src.dataset, src.cells, src.model, src.train, src.eval, src.un
 data/
   README.md          # explains gitignored subsets
   flickr_geo_tiny/   # 5-10k debug — via scripts/download_subset.py --dataset flickr_geo_tiny
-  osv5m_subset_10k/  # 10k stratified — via --dataset osv5m --max-samples 10000
+  osv5m_subset_10k/  # train-split subset — via --dataset osv5m --split train (plan first, then --yes)
+  osv5m_test/        # official OSV test, eval-only — via --split test (never train)
   im2gps3k/          # 3k eval only — never train — via --dataset im2gps3k
   .gitkeep
 ```
@@ -42,10 +43,14 @@ data/
 # 1) Create a tiny dummy CSV (50 rows) for overfit check
 python scripts/download_subset.py --dataset flickr_geo_tiny --output-dir data/flickr_geo_tiny --max-samples 50 --dry-run
 
-# 2) Real download (tiny only) — requires huggingface_hub login if gated
-python scripts/download_subset.py --dataset flickr_geo_tiny --output-dir data/flickr_geo_tiny
-python scripts/download_subset.py --dataset osv5m --output-dir data/osv5m_subset_10k --max-samples 10000
-python scripts/download_subset.py --dataset im2gps3k --output-dir data/im2gps3k
+# 2) Real OSV-5M subset — SAFE downloader (never fetches the ~259GB repo).
+#    WARNING: osv5m/osv5m is about 259GB in full and the selected shards are multi-GB.
+#    Always inspect the plan first (no network, no files), then re-run with --yes.
+python scripts/download_subset.py --dataset osv5m --split train --output-dir data/osv5m_subset_10k --max-samples 10000 --plan-only
+python scripts/download_subset.py --dataset osv5m --split train --output-dir data/osv5m_subset_10k --max-samples 10000 --yes
+#    Official OSV test (eval-only, separate dir — never train on it):
+python scripts/download_subset.py --dataset osv5m --split test --output-dir data/osv5m_test --max-samples 3000 --plan-only
+#    IM2GPS3k is manual-only (authors' download) — the script prints instructions.
 
 # 3) Train smoke — overfit 50 images, 224px, AMP, batch 32->16 fallback note
 python -m src.train --csv data/flickr_geo_tiny/metadata.csv --num-cells 300 --epochs 2 --batch-size 32 --image-size 224 --amp
