@@ -79,4 +79,4 @@ KPlaceNet/
 
 - Windows paths safe — uses `pathlib.Path`, no hardcoded absolute paths.
 - Imports use `src.*` absolute form; `src` is a package (`src/__init__.py`).
-- Heavy work (training, large downloads) is stubbed/flagged — L0 only scaffolds.
+- L0 and the first real L1 baseline are complete. Results are recorded in `docs/results/l1_baseline.md`; generated datasets/checkpoints remain gitignored.
