@@ -356,6 +356,40 @@ def _stream_match_train_csv(
     return found, bytes_scanned, eof
 
 
+def _assign_quotas(n_shards: int, total: int, caps: list[int]) -> list[int]:
+    """Fair per-shard quotas summing to min(total, sum(caps)).
+
+    Round-robin one slot at a time in shard order (deterministic); a shard
+    never exceeds its cap (member count). E.g. 4 shards, 10000 -> 2500 each;
+    1 shard -> min(total, members).
+    """
+    quotas = [0] * n_shards
+    remaining = total
+    while remaining > 0:
+        progressed = False
+        for i in range(n_shards):
+            if remaining <= 0:
+                break
+            if quotas[i] < caps[i]:
+                quotas[i] += 1
+                remaining -= 1
+                progressed = True
+        if not progressed:
+            break
+    return quotas
+
+
+def _resolve_shard_zip(tmp: Path, split: str, shard: str) -> Path | None:
+    cands = [
+        tmp / "images" / split / f"{shard}.zip",
+        tmp / Path(_osv_shard_name(split, shard)),
+    ]
+    for p in cands:
+        if p.exists():
+            return p
+    return None
+
+
 def _extract_members(zip_path: Path, members: list[str], dest_dir: Path) -> tuple[int, list[str]]:
     """Extract only the named members. Returns (extracted, missing)."""
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -401,8 +435,10 @@ def print_osv_plan(args: argparse.Namespace, output_dir: Path) -> None:
         else:
             print(f"  metadata: train.csv (~{OSV_TRAIN_CSV_GB}GB full) NEVER fully downloaded; chunked Range streaming scan, "
                   f"cap {args.csv_scan_cap_mb}MB, chunk {args.chunk_mb}MB")
-        print(f"  shards: sequential {args.split} shards [{', '.join(shards)}] (up to --max-shards={args.max_shards}); "
+        print(f"  shards: shard-balanced {args.split} shards [{', '.join(shards)}] (up to --max-shards={args.max_shards}); "
               f"sizes checked via HEAD at download time")
+        print(f"  sampling: seeded per-shard quotas summing to {max_samples} (seed {args.seed}); "
+              f"one Range/stream pass over the candidate-ID union (no per-shard re-scan, no first-rows bias)")
     print(f"  output: {output_dir / 'metadata.csv'} with image_path,lat,lon,id,split (+country/region if source has them)")
     print(f"  provenance: split={args.split} for every row. Train is NEVER split into eval.")
     print(f"  eval: use --split test (official OSV test, eval-only) into a separate output dir; never train on it.")
@@ -512,27 +548,67 @@ def run_osv(args: argparse.Namespace, output_dir: Path, token: str | None) -> No
         _report_counts(max_samples, len(out_rows), extracted_total, missing_all)
         return
 
-    # ---- split == train ----
+    # ---- split == train (shard-balanced, deterministic) ----
+    # 1) Download ONLY the selected shard zips; list each shard's member ids.
+    #    Quotas below sum to max_samples so no shard/file-order dominates.
+    shard_members: list[list[str]] = []
+    for shard in shards:
+        name = _osv_shard_name("train", shard)
+        size = _head_size(_hub_url(name), token)
+        print(f"[shard] {name}: {_fmt_bytes(size)}")
+        zpath = _hub_download(name, tmp, token)
+        with zipfile.ZipFile(zpath) as zf:
+            names = [nm for nm in zf.namelist() if not nm.endswith("/")]
+        stems = sorted({_stem(nm) for nm in names})
+        print(f"[shard] {name}: {len(names)} members, {len(stems)} unique ids")
+        shard_members.append(stems)
+
+    quotas = _assign_quotas(len(shards), max_samples, [len(s) for s in shard_members])
+    per_shard_cands: list[list[str]] = []
+    seen: set[str] = set()
+    for stems, q in zip(shard_members, quotas):
+        pick = rng.sample(stems, min(q, len(stems))) if stems and q > 0 else []
+        uniq = [c for c in pick if c not in seen]
+        seen.update(uniq)
+        per_shard_cands.append(uniq)
+    for shard, stems, cands, q in zip(shards, shard_members, per_shard_cands, quotas):
+        print(f"[sample] shard {shard}: members={len(stems)} quota={q} candidates={len(cands)}")
+    union_ids = [c for cands in per_shard_cands for c in cands]
+    print(f"[sample] candidate union: {len(union_ids)} ids across {len(shards)} shard(s) (seed {args.seed})")
+    if not union_ids:
+        raise OSVDownloadError("Selected shards contain no image ids.")
+
     stream_url = _hub_url("train.csv")
     chunk_bytes = args.chunk_mb * 1024 * 1024
     cap_bytes = args.csv_scan_cap_mb * 1024 * 1024
-    total_streamed = 0
 
     if args.allow_full_train_csv:
         print(f"[download] FULL train.csv (~{OSV_TRAIN_CSV_GB}GB, single file, explicit opt-in)")
         local_csv = _hub_download("train.csv", tmp, token)
+        member_of = [set(s) for s in shard_members]
+        pool_by_shard: list[list[dict]] = [[] for _ in shards]
+        extra_cols_set: set[str] = set()
         with open(local_csv, newline="", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
             header = reader.fieldnames or []
             id_col = _find_col(header, *ID_CANDS)
+            path_col = _find_col(header, *PATH_CANDS)
             lat_col = _find_col(header, *LAT_CANDS)
             lon_col = _find_col(header, *LON_CANDS)
             if lat_col is None or lon_col is None:
                 raise OSVDownloadError(f"train.csv lacks lat/lon columns (got: {header}).")
+            if id_col is None and path_col is None:
+                raise OSVDownloadError(f"train.csv header has neither id nor path column (got: {header}).")
             extra_cols = [c for c in header if _find_col([c], *EXTRA_CANDS) is not None]
-            pool = []
+            cand_set = set(union_ids)
             for r in reader:
-                if id_col is None or not r.get(id_col):
+                keys = set()
+                if id_col and r.get(id_col):
+                    keys.add(str(r[id_col]).strip())
+                if path_col and r.get(path_col):
+                    keys.add(_stem(str(r[path_col]).strip()))
+                hit = next((k for k in keys if k in cand_set), None)
+                if hit is None:
                     continue
                 try:
                     lat = float(r[lat_col])
@@ -541,68 +617,71 @@ def run_osv(args: argparse.Namespace, output_dir: Path, token: str | None) -> No
                     continue
                 if not (-90 <= lat <= 90 and -180 <= lon <= 180):
                     continue
-                rec2: dict[str, Any] = {"lat": lat, "lon": lon, "id": str(r[id_col]).strip(), "split": "train"}
+                rec2: dict[str, Any] = {"lat": lat, "lon": lon, "id": hit, "split": "train"}
                 for c in extra_cols:
                     rec2[c] = r.get(c, "")
-                pool.append(rec2)
-        print(f"[meta] train.csv: {len(pool)} valid rows")
-        if len(pool) > max_samples:
-            pool = rng.sample(pool, max_samples)
-        wanted_ids = [r["id"] for r in pool]
-        by_id = {r["id"]: r for r in pool}
-    else:
-        print(f"[stream] train.csv via Range chunks (cap {args.csv_scan_cap_mb}MB) - full file (~{OSV_TRAIN_CSV_GB}GB) never fetched wholly")
+                if path_col and r.get(path_col):
+                    rec2["_src_path"] = str(r[path_col]).strip()
+                for si, mset in enumerate(member_of):
+                    if hit in mset:
+                        pool_by_shard[si].append(rec2)
+                        break
+                cand_set.discard(hit)
+                if not cand_set:
+                    pass  # all candidates matched; keep scanning cheaply? break to save time
+                    break
+        n_pool = sum(len(p) for p in pool_by_shard)
+        print(f"[meta] train.csv (full, opt-in): {n_pool}/{len(union_ids)} candidate ids matched")
         by_id = {}
-        wanted_ids = []
-        extra_cols = []
-        for shard in shards:
-            name = _osv_shard_name("train", shard)
-            size = _head_size(_hub_url(name), token)
-            print(f"[shard] {name}: {_fmt_bytes(size)}")
-            zpath = _hub_download(name, tmp, token)
-            with zipfile.ZipFile(zpath) as zf:
-                names = [nm for nm in zf.namelist() if not nm.endswith("/")]
-            stems = sorted({_stem(nm) for nm in names})
-            print(f"[shard] {name}: {len(names)} members, {len(stems)} unique ids")
-            new_ids = [s for s in stems if s not in by_id]
-            if not new_ids:
-                continue
-            # Stream-scan for the union of still-unmatched ids (seeded order).
-            pending = {s: {} for s in rng.sample(new_ids, len(new_ids))}
-            found, scanned, eof = _stream_match_train_csv(
-                stream_url, pending, max_samples - len(by_id),
-                chunk_bytes, cap_bytes - total_streamed, token)
-            total_streamed += scanned
-            print(f"[scan] matched {len(found)}/{len(pending)} ids in {_fmt_bytes(scanned)} "
-                  f"(cumulative {_fmt_bytes(total_streamed)}, eof={eof})")
-            by_id.update(found)
-            if found:
-                extra_cols = sorted({k for r in found.values() for k in r
-                                     if k not in ("lat", "lon", "id", "split", "_src_path")})
-            if len(by_id) >= max_samples:
-                break
-            if total_streamed >= cap_bytes:
-                raise OSVDownloadError(
-                    f"Scan cap ({args.csv_scan_cap_mb}MB) hit with only {len(by_id)}/{max_samples} rows matched. "
-                    "Narrow with --shards, raise --csv-scan-cap-mb, or pass --allow-full-train-csv "
-                    "to download the full train.csv (~2.92GB). No images downloaded beyond the listed shards.")
-        wanted_ids = list(by_id.keys())[:max_samples]
+        for si, pool in enumerate(pool_by_shard):
+            for rec in pool:
+                by_id.setdefault(rec["id"], rec)
+        for si, (shard, cands) in enumerate(zip(shards, per_shard_cands)):
+            m = sum(1 for c in cands if c in by_id)
+            print(f"[meta] shard {shard}: candidates={len(cands)} metadata={m}")
+        extra_cols = sorted({k for r in by_id.values() for k in r
+                             if k not in ("lat", "lon", "id", "split", "_src_path")})
+        # Full-CSV path still honors the candidate union: only candidate ids
+        # from the SELECTED shards are kept (never arbitrary global rows).
+        wanted_ids = [c for c in union_ids if c in by_id]
+        total_streamed = 0
+    else:
+        print(f"[stream] train.csv via Range chunks, SINGLE pass for the candidate union "
+              f"(cap {args.csv_scan_cap_mb}MB) - full file (~{OSV_TRAIN_CSV_GB}GB) never fetched wholly")
+        pending = {c: {} for c in union_ids}
+        found, scanned, eof = _stream_match_train_csv(
+            stream_url, pending, len(pending), chunk_bytes, cap_bytes, token)
+        total_streamed = scanned
+        by_id = found
+        extra_cols = sorted({k for r in found.values() for k in r
+                             if k not in ("lat", "lon", "id", "split", "_src_path")})
+        for shard, cands in zip(shards, per_shard_cands):
+            m = sum(1 for c in cands if c in found)
+            print(f"[scan] shard {shard}: candidates={len(cands)} metadata={m}")
+        print(f"[scan] single-pass match: {len(found)}/{len(pending)} candidates in "
+              f"{_fmt_bytes(scanned)} (eof={eof})")
+        if len(found) < len(pending) and not eof and scanned >= cap_bytes:
+            raise OSVDownloadError(
+                f"Scan cap ({args.csv_scan_cap_mb}MB) hit with only {len(found)}/{len(pending)} "
+                f"candidate ids matched. No arbitrary first-rows fallback: narrow with --shards, "
+                "raise --csv-scan-cap-mb, or pass --allow-full-train-csv "
+                "to download the full train.csv (~2.92GB). No images extracted beyond matched candidates.")
+        wanted_ids = [c for c in union_ids if c in by_id]
 
-    # Extract only matched ids from the downloaded shards.
+    # Extract ONLY matched candidate ids from the downloaded shards.
     extracted_total = 0
     missing_all = []
-    for shard in shards:
-        zpath = tmp / "images" / "train" / f"{shard}.zip"
-        alt = tmp / Path(_osv_shard_name("train", shard))
-        zp = zpath if zpath.exists() else alt
-        if not zp.exists():
+    for shard, cands in zip(shards, per_shard_cands):
+        zp = _resolve_shard_zip(tmp, "train", shard)
+        if zp is None:
             continue
         with zipfile.ZipFile(zp) as zf:
             stems = {_stem(nm) for nm in zf.namelist() if not nm.endswith("/")}
         todo = [i for i in wanted_ids if i in stems]
         n, missing = _extract_members(zp, todo, images_dir)
         extracted_total += n
-        print(f"[extract] {zp.name}: extracted {n} selected")
+        m = sum(1 for c in cands if c in by_id)
+        print(f"[extract] {zp.name}: candidates={len(cands)} metadata={m} extracted={n} selected")
     on_disk = {_stem(p.name) for p in images_dir.iterdir() if p.is_file()}
     out_rows = []
     for i in wanted_ids:

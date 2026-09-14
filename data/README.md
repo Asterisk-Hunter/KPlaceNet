@@ -48,7 +48,7 @@ python scripts/download_subset.py --dataset osv5m --split test --output-dir data
 
 - CSV format: header `image_path,lat,lon` plus `id,split` provenance (+country/region if the source has them). `image_path` may be absolute or relative to the CSV file.
 - OSV-5M train/test spatial separation (1km) is respected: train rows keep `split=train` and are NEVER re-split into eval; eval uses `--split test` output or IM2GPS3k.
-- Full train.csv (~2.92GB) is never fetched unless you pass the explicit opt-in `--allow-full-train-csv`; otherwise train rows are found by capped Range streaming (`--csv-scan-cap-mb`, default 512MB) and the script aborts honestly instead of silently downloading huge files.
+- Full train.csv (~2.92GB) is never fetched unless you pass the explicit opt-in `--allow-full-train-csv`; otherwise train rows are found by a SINGLE capped Range streaming pass (`--csv-scan-cap-mb`, default 512MB) over a seeded shard-balanced candidate union (per-shard quotas summing to `--max-samples`), and the script aborts honestly instead of silently downloading huge files or falling back to first-rows/file-order sampling.
 - Row counts are honest: if fewer than `--max-samples` are extracted the script says so and never claims '10k'.
 - Full OSV-5M (5.1M) / YFCC100M are **out of scope** for this plan.
 
