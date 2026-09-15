@@ -61,7 +61,8 @@ python -m src.eval --csv data/im2gps3k/metadata.csv --checkpoint checkpoints/las
 
 - `src/train.py` uses AMP (`torch.cuda.amp`) and CE loss; checkpoint saved to `checkpoints/last.pt`.
 - If OOM on 4050: re-run with `--batch-size 16` or `--batch-size 8` (plan Section 3/8).
-- `src/cells.py` provides `build_cells` / `assign_cells` stubs (quad-tree K~300 in L1; k-means/DBSCAN in L4).
+- `src/cells.py` provides `build_cells` / `assign_cells` (quad-tree K~300 in L1; k-means/DBSCAN in L4).
+- `src/uncertainty.py` provides L3 uncertainty: `TemperatureScaler`, `expected_calibration_error`, `conformal_prediction_set`, `abstention_mask`.
 
 ## Repo Layout
 
@@ -130,3 +131,40 @@ Each run saves to `checkpoints/l2_<init>_<fraction>_<regime>/`:
 ### Fixed-Cell Fairness
 
 All data fractions in an L2 experiment use the same cells (built once from the full 10k CSV, saved as JSON). This ensures the classifier head has identical architecture across fractions — the only variable is training data size. Pass `--cells-json` to train.py to load fixed cells; otherwise cells are built from the CSV.
+
+## L3 — Uncertainty-Aware Geolocation (Gap 3)
+
+L3 adds post-hoc uncertainty calibration to the L2 winner (`l2_imagenet_1.0_layer4`):
+temperature scaling (Guo et al. 2017), split-conformal prediction sets, and
+confidence-based abstention.
+
+### Quick Start — Plan-Only (no GPU, no images loaded)
+
+```powershell
+# Print the full L3 experiment plan (default: plan-only)
+python scripts/run_l3_uncertainty.py
+
+# Custom calibration size and alpha
+python scripts/run_l3_uncertainty.py --calibration-size 500 --alpha 0.05
+```
+
+### Full L3 Run (requires OSV test images + L2 checkpoint)
+
+```powershell
+# Run L3 on the selected checkpoint with default settings
+#   - Calibration: first 1000 rows of OSV test (withheld from eval)
+#   - Evaluation:  remaining 2000 rows
+#   - Temperature scaling + conformal + abstention analysis
+python scripts/run_l3_uncertainty.py --run
+
+# Custom settings
+python scripts/run_l3_uncertainty.py --run --alpha 0.05 --threshold 0.3 0.5 0.7
+```
+
+> **Calibration caveat:** The first 1000 examples of the official OSV test subset
+> (`data/osv5m_test/metadata.csv`) are used as the calibration split for both
+> temperature scaling and conformal threshold fitting.  These 1000 examples are
+> **withheld** from all final L3 evaluation metrics (ECE, coverage, abstention,
+> distance).  Only the remaining 2000 examples are used for final evaluation.
+> This is a deterministic split (rows 0–999 = calibration, 1000–2999 = eval)
+> controlled by `--seed`.
