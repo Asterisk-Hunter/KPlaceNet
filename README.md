@@ -168,3 +168,64 @@ python scripts/run_l3_uncertainty.py --run --alpha 0.05 --threshold 0.3 0.5 0.7
 > distance).  Only the remaining 2000 examples are used for final evaluation.
 > This is a deterministic split (rows 0–999 = calibration, 1000–2999 = eval)
 > controlled by `--seed`.
+
+## L4 — Adaptive Cell Construction (Gap 1)
+
+L4 compares three cell construction methods at K=300 using the L2 winner backbone
+(ResNet-50, ImageNet init, layer4 fine-tune, 100% data, 10 epochs):
+
+- **quad-tree** — density-driven recursive spatial bisection (axis-aligned boxes)
+- **kmeans** — MiniBatchKMeans on (lat, lon) with cos-mean-lon equal-area scaling
+- **dbscan** — DBSCAN density clustering with eps binary search to hit ~K clusters,
+  noise reassignment to nearest centroid, merge/split normalization to exactly K
+
+### Quick Start — Plan-Only (no GPU, no images loaded)
+
+```powershell
+# Print the full L4 experiment plan (default: plan-only)
+python scripts/run_l4_experiments.py
+
+# Custom methods
+python scripts/run_l4_experiments.py --methods kmeans dbscan
+```
+
+### Full L4 Run (requires 10k training CSV + OSV test images)
+
+```powershell
+# Run all 3 methods (builds cells, trains, evaluates)
+python scripts/run_l4_experiments.py --run
+
+# Resume with existing checkpoints
+python scripts/run_l4_experiments.py --run --skip-existing
+
+# Single method
+python scripts/run_l4_experiments.py --run --methods kmeans
+```
+
+### Adaptive Assignment
+
+`assign_cells` handles both quad-tree boxes and adaptive/overlapping clusters:
+1. Collect all cells whose bounding box contains the point
+2. Among containing cells, pick the nearest centroid (haversine)
+3. If no cell contains the point, pick the nearest centroid overall
+
+This resolves ambiguity when k-means/DBSCAN clusters overlap spatially.
+
+### Urban/Rural Proxy
+
+OSV-5M has no urban/rural labels.  L4 uses a **cell-count proxy**: cells with
+training point count > median are "urban" (dense), count <= median are "rural"
+(sparse).  This is reported transparently as an approximation — see
+`docs/results/l4_adaptive_cells.md` for caveats.
+
+### Results
+
+| Method | @1km | @25km | @200km | Mean Dist | Gini |
+|--------|------|-------|--------|-----------|------|
+| quad_tree | 0.00% | 0.27% | 3.33% | 6025 km | 0.370 |
+| kmeans | 0.00% | 0.17% | 4.07% | 6058 km | 0.324 |
+| dbscan | 0.00% | 0.07% | 3.47% | 6084 km | 0.559 |
+
+**Recommended default: kmeans** (highest within-200km, best cell balance).
+
+Full results in `docs/results/l4_adaptive_cells.md`.
