@@ -69,6 +69,13 @@
 - Regime: frozen vs last-block fine-tune
 - Log: learning curves, convergence steps, final acc @1/25/200km
 
+**L2 Implementation Notes:**
+- Cells are built ONCE from the full 10k CSV and serialized to JSON (`--save-cells` / `--cells-json` in `train.py`). All data fractions use the same fixed cells for fairness. Effective `num_cells` is recorded in checkpoints and metrics JSON.
+- `--max-samples` provides deterministic seeded subset selection (numpy `RandomState(seed=42)`). Subset does not rebuild cells when `--cells-json` is supplied.
+- Places365 init uses the official checkpoint (`resnet50_places365.pth.tar`, ~97 MB) loaded via `model.load_places365_checkpoint()`. The loader unwraps `module.` prefixes, matches backbone keys by shape, and reports loaded/skipped counts. Never silently claims full loading.
+- `scripts/run_l2_experiments.py` orchestrates the 12-run matrix. Default is plan-only. Single-run smoke: `--run --fractions 0.01 --inits imagenet --regimes frozen --epochs 1`.
+- Per-run metrics JSON saved to checkpoint dir with loss, cell accuracy, trainable params, device, elapsed time, and full args.
+
 **Exit:** Table + curves showing winner. Decision recorded: which init + regime goes into L3/L4. This justifies everything after.
 
 ### L3 Gap 3 — Uncertainty (SECOND GAP)

@@ -80,3 +80,53 @@ KPlaceNet/
 - Windows paths safe — uses `pathlib.Path`, no hardcoded absolute paths.
 - Imports use `src.*` absolute form; `src` is a package (`src/__init__.py`).
 - L0 and the first real L1 baseline are complete. Results are recorded in `docs/results/l1_baseline.md`; generated datasets/checkpoints remain gitignored.
+
+## L2 — Data-Efficient Training (Gap 4)
+
+L2 varies data fraction (1% / 10% / 100%), transfer init (ImageNet vs Places365), and training regime (frozen vs layer4 fine-tune) to test the 10x data-saving hypothesis.
+
+### Quick Start — Plan-Only (no downloads, no GPU)
+
+```powershell
+# Print the full 12-run matrix plan (no execution)
+python scripts/run_l2_experiments.py --plan-only
+
+# Print a single fraction/init/regime combination
+python scripts/run_l2_experiments.py --plan-only --fractions 0.01 --inits imagenet --regimes frozen
+```
+
+### One-Run Smoke Test (ImageNet only, no Places365 download needed)
+
+```powershell
+# 1% fraction, ImageNet init, frozen backbone, 1 epoch — fast smoke check
+python scripts/run_l2_experiments.py --run --fractions 0.01 --inits imagenet --regimes frozen --epochs 1
+
+# Or run train.py directly with fixed cells
+python scripts/download_subset.py --dataset flickr_geo_tiny --output-dir data/flickr_geo_tiny --dry-run
+python -m src.train --csv data/flickr_geo_tiny/metadata.csv --num-cells 300 --epochs 1 --batch-size 32 --amp --save-cells checkpoints/cells_smoke.json
+python -m src.train --csv data/flickr_geo_tiny/metadata.csv --num-cells 300 --epochs 1 --batch-size 32 --amp --cells-json checkpoints/cells_smoke.json --max-samples 25
+```
+
+### Full L2 Runs (requires 10k CSV + optional Places365 checkpoint)
+
+```powershell
+# Download official Places365 checkpoint (~97 MB, plan-only by default)
+python scripts/download_places365.py                          # prints plan
+python scripts/download_places365.py --yes                    # downloads to checkpoints/places365/
+
+# Run all 12 combinations (uses sys.executable, safe subprocess)
+python scripts/run_l2_experiments.py --run --epochs 10
+
+# Run specific subset
+python scripts/run_l2_experiments.py --run --fractions 0.01 0.10 --inits imagenet places365 --regimes frozen layer4 --skip-existing
+```
+
+### L2 Checkpoint Structure
+
+Each run saves to `checkpoints/l2_<init>_<fraction>_<regime>/`:
+- `last.pt` / `best.pt` — model + optimizer + cells + `num_cells` (effective)
+- `metrics_<run_tag>.json` — per-epoch loss, cell accuracy, trainable params, device, elapsed time, args
+
+### Fixed-Cell Fairness
+
+All data fractions in an L2 experiment use the same cells (built once from the full 10k CSV, saved as JSON). This ensures the classifier head has identical architecture across fractions — the only variable is training data size. Pass `--cells-json` to train.py to load fixed cells; otherwise cells are built from the CSV.

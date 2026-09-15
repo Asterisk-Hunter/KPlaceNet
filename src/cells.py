@@ -3,13 +3,17 @@
 L0: stubs only (no heavy deps). L1 builds quad-tree 200-500 from 10k subset.
 L4 swaps to k-means / DBSCAN same K. Imports kept light for scaffold.
 
+L2: JSON serialization/deserialization for fixed-cell fairness.
+
 Constraints: K max ~300 for 4050 (Section 8).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import List, Tuple, Optional
+import json
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Tuple, Optional
 
 import torch
 import numpy as np
@@ -282,3 +286,69 @@ def assign_cells(
 def cells_to_centroids(cells: List[Cell]) -> np.ndarray:
     """Return Kx2 array of (lat, lon) centroids for model output mapping."""
     return np.array([[c.centroid_lat, c.centroid_lon] for c in cells], dtype=np.float64)
+
+
+# ---------------------------------------------------------------------------
+# L2: JSON serialization / deserialization for fixed-cell fairness
+# ---------------------------------------------------------------------------
+
+
+def save_cells_json(cells: List[Cell], path: str | Path) -> Path:
+    """Serialize cells to a JSON file for reproducible fixed-cell experiments.
+
+    Args:
+        cells: list of Cell dataclasses
+        path: output JSON file path
+
+    Returns:
+        Resolved Path of the written file.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "num_cells": len(cells),
+        "cells": [asdict(c) for c in cells],
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    print(f"[cells] saved {len(cells)} cells -> {path}")
+    return path.resolve()
+
+
+def load_cells_json(path: str | Path) -> List[Cell]:
+    """Deserialize cells from a JSON file.
+
+    Args:
+        path: JSON file previously written by save_cells_json.
+
+    Returns:
+        List[Cell] in the same order as saved.
+
+    Raises:
+        FileNotFoundError: if path does not exist.
+        KeyError/ValueError: if JSON structure is invalid.
+    """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Cells JSON not found: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    cells_raw = data.get("cells")
+    if cells_raw is None or not isinstance(cells_raw, list):
+        raise ValueError(f"Invalid cells JSON at {path}: missing or non-list 'cells' key")
+    cells: List[Cell] = []
+    for i, c in enumerate(cells_raw):
+        cells.append(
+            Cell(
+                cell_id=int(c["cell_id"]),
+                lat_min=float(c["lat_min"]),
+                lat_max=float(c["lat_max"]),
+                lon_min=float(c["lon_min"]),
+                lon_max=float(c["lon_max"]),
+                centroid_lat=float(c["centroid_lat"]),
+                centroid_lon=float(c["centroid_lon"]),
+                count=int(c.get("count", 0)),
+            )
+        )
+    print(f"[cells] loaded {len(cells)} cells from {path}")
+    return cells
