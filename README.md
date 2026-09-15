@@ -79,7 +79,7 @@ KPlaceNet/
 
 - Windows paths safe — uses `pathlib.Path`, no hardcoded absolute paths.
 - Imports use `src.*` absolute form; `src` is a package (`src/__init__.py`).
-- L0 and the first real L1 baseline are complete. Results are recorded in `docs/results/l1_baseline.md`; generated datasets/checkpoints remain gitignored.
+- L0, L1, and the full L2 matrix are complete. Results are recorded in `docs/results/l1_baseline.md` and `docs/results/l2_data_efficiency.md`; generated datasets/checkpoints remain gitignored.
 
 ## L2 — Data-Efficient Training (Gap 4)
 

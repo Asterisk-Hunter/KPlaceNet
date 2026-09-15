@@ -224,6 +224,26 @@ def load_places365_checkpoint(
             new_k = new_k[len("module."):]
         cleaned_sd[new_k] = v
 
+    # GeoClassifier stores torchvision children in a numeric Sequential:
+    # conv1=0, bn1=1, layer1=4, layer2=5, layer3=6, layer4=7, avgpool=8.
+    # The official Places365 checkpoint uses the original named keys, so map
+    # those names before comparing shapes.
+    child_prefixes = {
+        "conv1": "0",
+        "bn1": "1",
+        "layer1": "4",
+        "layer2": "5",
+        "layer3": "6",
+        "layer4": "7",
+        "avgpool": "8",
+    }
+
+    def map_checkpoint_key(key: str) -> str:
+        prefix, separator, suffix = key.partition(".")
+        if prefix in child_prefixes and separator:
+            return f"{child_prefixes[prefix]}.{suffix}"
+        return child_prefixes.get(prefix, prefix)
+
     # Build a view of the backbone's expected keys/shapes
     backbone_state = model.backbone.state_dict()
     backbone_keys = set(backbone_state.keys())
@@ -233,25 +253,27 @@ def load_places365_checkpoint(
     skipped: list[str] = []
     mismatched: list[str] = []
 
-    for ckpt_key in sorted(cleaned_sd.keys()):
-        ckpt_tensor = cleaned_sd[ckpt_key]
-        if ckpt_key.startswith("head.") or ckpt_key.startswith("fc."):
-            skipped.append(ckpt_key)
+    for original_key in sorted(cleaned_sd.keys()):
+        ckpt_tensor = cleaned_sd[original_key]
+        if original_key.startswith("head.") or original_key.startswith("fc."):
+            skipped.append(original_key)
             continue
+        ckpt_key = map_checkpoint_key(original_key)
         if ckpt_key not in backbone_keys:
-            skipped.append(ckpt_key)
+            skipped.append(original_key)
             continue
         # Shape check
         target_shape = backbone_state[ckpt_key].shape
         if ckpt_tensor.shape != target_shape:
-            mismatched.append(f"{ckpt_key}: ckpt {tuple(ckpt_tensor.shape)} vs model {tuple(target_shape)}")
+            mismatched.append(f"{original_key}: ckpt {tuple(ckpt_tensor.shape)} vs model {tuple(target_shape)}")
             continue
         # Match — assign
         backbone_state[ckpt_key] = ckpt_tensor
-        loaded.append(ckpt_key)
+        loaded.append(original_key)
 
     # Check for backbone keys missing from checkpoint
-    missing_from_ckpt = backbone_keys - {k for k in cleaned_sd.keys() if k in backbone_keys}
+    mapped_checkpoint_keys = {map_checkpoint_key(k) for k in cleaned_sd.keys()}
+    missing_from_ckpt = backbone_keys - mapped_checkpoint_keys
     # Only flag missing if they weren't already in mismatched
     missing_from_ckpt_names = sorted(missing_from_ckpt - set(m.split(":")[0] for m in mismatched))
 
