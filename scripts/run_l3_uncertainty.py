@@ -1,8 +1,8 @@
 """L3 Uncertainty — temperature scaling, conformal prediction, abstention.
 
 Loads the selected L2 winner checkpoint (l2_imagenet_1.0_layer4/last.pt),
-splits the official OSV test set deterministically into calibration (first 1000)
-and evaluation (remaining 2000), then reports:
+splits the official OSV test set deterministically into seeded, disjoint
+temperature-fit, conformal-calibration, and evaluation partitions, then reports:
 
   - Raw vs temperature-scaled ECE
   - Conformal prediction set coverage and mean set size
@@ -17,7 +17,10 @@ Windows-safe: pathlib, sys.executable, num_workers=0.
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
+import math
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -30,8 +33,14 @@ import torch.nn.functional as F
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src.cells import assign_cells, load_cells_json  # noqa: E402
-from src.model import build_model  # noqa: E402
+from src.cells import assign_cells  # noqa: E402
+from src.reproducibility import (  # noqa: E402
+    make_l3_split,
+    sha256_file,
+    split_manifest,
+    stable_sample_ids,
+)
+from src.regional_eval import spatial_stratified_metrics  # noqa: E402
 from src.uncertainty import (  # noqa: E402
     TemperatureScaler,
     abstention_mask,
@@ -47,11 +56,26 @@ from src.uncertainty import (  # noqa: E402
 DEFAULT_CHECKPOINT = ROOT / "checkpoints" / "l2_imagenet_1.0_layer4" / "last.pt"
 DEFAULT_CSV = ROOT / "data" / "osv5m_test" / "metadata.csv"
 DEFAULT_CALIBRATION_SIZE = 1000
+DEFAULT_TEMPERATURE_SIZE = 500
 DEFAULT_ALPHA = 0.1
 DEFAULT_THRESHOLD = 0.5
 DEFAULT_BATCH_SIZE = 32
 DEFAULT_SEED = 42
 DEFAULT_IMAGE_SIZE = 224
+DEFAULT_REGION_LAT_BANDS = 6
+DEFAULT_REGION_LON_BANDS = 12
+DEFAULT_REGION_MIN_COUNT = 30
+
+
+def positive_int(value: str) -> int:
+    """Argparse type for positive integer settings."""
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a positive integer") from error
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +101,11 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--calibration-size", type=int, default=DEFAULT_CALIBRATION_SIZE,
-        help=f"Number of samples for calibration split (default: {DEFAULT_CALIBRATION_SIZE})",
+        help=f"Number of samples for conformal calibration (default: {DEFAULT_CALIBRATION_SIZE})",
+    )
+    p.add_argument(
+        "--temperature-size", type=int, default=DEFAULT_TEMPERATURE_SIZE,
+        help=f"Separate temperature-fitting sample count (default: {DEFAULT_TEMPERATURE_SIZE})",
     )
     p.add_argument(
         "--alpha", type=float, default=DEFAULT_ALPHA,
@@ -106,6 +134,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--seed", type=int, default=DEFAULT_SEED,
         help=f"RNG seed for deterministic split (default: {DEFAULT_SEED})",
+    )
+    p.add_argument(
+        "--region-lat-bands", type=positive_int, default=DEFAULT_REGION_LAT_BANDS,
+        help=(
+            "Equal-area latitude bands for regional diagnostics "
+            f"(default: {DEFAULT_REGION_LAT_BANDS})"
+        ),
+    )
+    p.add_argument(
+        "--region-lon-bands", type=positive_int, default=DEFAULT_REGION_LON_BANDS,
+        help=f"Longitude bands for regional diagnostics (default: {DEFAULT_REGION_LON_BANDS})",
+    )
+    p.add_argument(
+        "--region-min-count", type=positive_int, default=DEFAULT_REGION_MIN_COUNT,
+        help=(
+            "Minimum evaluation samples per region for metrics "
+            f"(default: {DEFAULT_REGION_MIN_COUNT})"
+        ),
     )
     return p.parse_args()
 
@@ -179,7 +225,7 @@ def eval_haversine(
     true_lats: np.ndarray,
     true_lons: np.ndarray,
     mask: torch.Tensor | None = None,
-) -> Dict[str, float]:
+) -> Dict[str, float | int | None]:
     """Compute haversine distance metrics on predicted cell centroids.
 
     Args:
@@ -193,19 +239,39 @@ def eval_haversine(
     Returns:
         dict with mean_km, median_km, within_{1,25,200}km.
     """
-    pred_ids = probs.argmax(dim=1).numpy()
+    if (
+        probs.ndim != 2
+        or probs.shape[1] == 0
+        or centroids.ndim != 2
+        or centroids.shape[1] != 2
+    ):
+        raise ValueError("probs must be (N, K) and centroids must be (K, 2)")
+    true_lats = np.asarray(true_lats, dtype=np.float64)
+    true_lons = np.asarray(true_lons, dtype=np.float64)
+    if (
+        true_lats.ndim != 1
+        or true_lons.ndim != 1
+        or len(true_lats) != len(probs)
+        or len(true_lons) != len(probs)
+    ):
+        raise ValueError("true coordinate arrays must match the number of predictions")
+    pred_ids = probs.argmax(dim=1).detach().cpu().numpy()
+    if pred_ids.size and pred_ids.max() >= len(centroids):
+        raise ValueError("predicted class index exceeds the available cell centroids")
     pred_lats = centroids[pred_ids, 0]
     pred_lons = centroids[pred_ids, 1]
 
     if mask is not None:
-        idx = mask.numpy().astype(bool)
+        idx = mask.detach().cpu().numpy().astype(bool)
+        if idx.ndim != 1 or len(idx) != len(pred_ids):
+            raise ValueError("mask must match the number of predictions")
         pred_lats = pred_lats[idx]
         pred_lons = pred_lons[idx]
         true_lats = true_lats[idx]
         true_lons = true_lons[idx]
 
     if len(pred_lats) == 0:
-        return {"mean_km": float("nan"), "median_km": float("nan"),
+        return {"mean_km": None, "median_km": None,
                 "within_1km": 0.0, "within_25km": 0.0, "within_200km": 0.0,
                 "n": 0}
 
@@ -215,6 +281,7 @@ def eval_haversine(
     dphi = np.radians(true_lats - pred_lats)
     dlam = np.radians(true_lons - pred_lons)
     a = np.sin(dphi / 2) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlam / 2) ** 2
+    a = np.clip(a, 0.0, 1.0)
     dists = 6371.0 * 2 * np.arcsin(np.sqrt(a))
 
     return {
@@ -243,30 +310,35 @@ def print_plan(args: argparse.Namespace) -> None:
     print()
     print(f"  Checkpoint:     {ckpt_path}")
     print(f"  Test CSV:       {csv_path}")
-    print(f"  Calibration:    first {args.calibration_size} rows (deterministic split)")
-    print(f"  Evaluation:     remaining rows (withheld from calibration)")
+    print(f"  Temperature:    {args.temperature_size} seeded random rows")
+    print(f"  Calibration:    {args.calibration_size} disjoint conformal rows")
+    print("  Evaluation:     remaining rows (withheld from both fitting splits)")
     print(f"  Alpha:          {args.alpha} (target coverage = {1 - args.alpha:.1%})")
     print(f"  Thresholds:     {args.threshold}")
     print(f"  Batch size:     {args.batch_size}")
     print(f"  Device:         {args.device}")
     print(f"  Image size:     {args.image_size}")
     print(f"  Seed:           {args.seed}")
+    print(
+        f"  Regional grid:  {args.region_lat_bands} x {args.region_lon_bands} "
+        f"(minimum n={args.region_min_count})"
+    )
     print()
     print("  Steps:")
     print("    1. Load checkpoint + cells metadata")
-    print("    2. Load OSV test CSV (3000 rows)")
-    print("    3. Deterministic split: calibration / evaluation")
+    print("    2. Load OSV test CSV")
+    print("    3. Seeded split: temperature fitting / conformal calibration / evaluation")
     print("    4. Assign ground-truth lat/lon to checkpoint cells")
-    print("    5. Run inference on both splits")
-    print("    6. Fit temperature on calibration logits/labels")
+    print("    5. Run inference on all three splits")
+    print("    6. Fit temperature on its separate temperature split")
     print("    7. Compare raw vs scaled ECE on evaluation")
-    print("    8. Fit conformal threshold on calibration probabilities")
+    print("    8. Fit conformal threshold on separate calibration probabilities")
     print("    9. Report eval coverage, mean set size, abstention, distances")
     print("   10. Write checkpoints/l3_uncertainty_results.json")
     print()
-    print("  NOTE: Calibration data (first 1000 rows) is withheld from")
-    print("        final L3 evaluation.  Only the remaining 2000 rows are")
-    print("        used for ECE, coverage, abstention, and distance metrics.")
+    print("  NOTE: All three splits are disjoint and recorded by row index and")
+    print("        sample ID in the output manifest. Coverage guarantees still")
+    print("        require exchangeability and do not imply regional validity.")
     print()
 
     # Print example run command
@@ -275,11 +347,15 @@ def print_plan(args: argparse.Namespace) -> None:
         f"--checkpoint {args.checkpoint} "
         f"--csv {args.csv} "
         f"--calibration-size {args.calibration_size} "
+        f"--temperature-size {args.temperature_size} "
         f"--alpha {args.alpha} "
         f"--threshold {' '.join(str(t) for t in args.threshold)} "
         f"--batch-size {args.batch_size} "
         f"--device {args.device} "
-        f"--seed {args.seed}"
+        f"--seed {args.seed} "
+        f"--region-lat-bands {args.region_lat_bands} "
+        f"--region-lon-bands {args.region_lon_bands} "
+        f"--region-min-count {args.region_min_count}"
     )
     print(f"  Run command:")
     print(f"    {run_cmd}")
@@ -310,6 +386,8 @@ def main() -> None:
     print("=" * 72)
     print("L3 UNCERTAINTY — EXECUTING")
     print("=" * 72)
+
+    from src.model import build_model
 
     # ------------------------------------------------------------------
     # 1. Load checkpoint
@@ -372,14 +450,29 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 4. Deterministic split
     # ------------------------------------------------------------------
-    cal_size = min(args.calibration_size, n_total)
-    eval_size = n_total - cal_size
-    cal_indices = list(range(cal_size))
-    eval_indices = list(range(cal_size, n_total))
-    print(f"[3/10] Split: calibration={cal_size}, evaluation={eval_size}")
-    print("  NOTE: First {0} rows are calibration (withheld from eval).".format(cal_size))
+    if (
+        args.temperature_size < 1
+        or args.calibration_size < 1
+        or args.temperature_size + args.calibration_size >= n_total
+    ):
+        raise ValueError(
+            "--temperature-size and --calibration-size must both be positive "
+            f"and sum to less than the {n_total} available rows"
+        )
+    temperature_size = args.temperature_size
+    cal_size = args.calibration_size
+    eval_size = n_total - temperature_size - cal_size
+    temperature_indices, cal_indices, eval_indices = make_l3_split(
+        n_total, temperature_size, cal_size, args.seed
+    )
+    print(
+        f"[3/10] Split: temperature={temperature_size}, "
+        f"calibration={cal_size}, evaluation={eval_size}"
+    )
+    print("  NOTE: Seeded random rows are disjoint across all three splits.")
 
     from torch.utils.data import Subset
+    temperature_dataset = Subset(full_ds, temperature_indices)
     cal_dataset = Subset(full_ds, cal_indices)
     eval_dataset = Subset(full_ds, eval_indices)
 
@@ -389,6 +482,19 @@ def main() -> None:
     # Get coords from full dataset, then split
     all_coords = full_ds.get_coords().numpy()
     all_cell_ids = assign_cells(all_coords, cells)
+    sample_ids = stable_sample_ids(full_ds.df.to_dict(orient="records"))
+    split_provenance = split_manifest(
+        temperature_indices=temperature_indices,
+        calibration_indices=cal_indices,
+        evaluation_indices=eval_indices,
+        sample_ids=sample_ids,
+        seed=args.seed,
+        csv_sha256=sha256_file(str(csv_path)),
+        checkpoint_sha256=sha256_file(str(ckpt_path)),
+    )
+    temperature_labels = torch.tensor(
+        [all_cell_ids[i] for i in temperature_indices], dtype=torch.long
+    )
     cal_labels = torch.tensor([all_cell_ids[i] for i in cal_indices], dtype=torch.long)
     eval_labels = torch.tensor([all_cell_ids[i] for i in eval_indices], dtype=torch.long)
 
@@ -397,20 +503,29 @@ def main() -> None:
     eval_true_lons = all_coords[eval_indices, 1]
 
     # ------------------------------------------------------------------
-    # 6. Run inference on calibration split
+    # 6. Run inference on temperature-fitting split
     # ------------------------------------------------------------------
-    print(f"[4/10] Inference on calibration split ({cal_size} samples)...")
+    print(f"[4/10] Inference on temperature split ({temperature_size} samples)...")
+    t0 = time.time()
+    temperature_logits, _ = collect_logits(
+        model, temperature_dataset, args.batch_size, device, args.num_workers
+    )
+    print(f"  done in {time.time() - t0:.1f}s")
+
+    # ------------------------------------------------------------------
+    # 7. Run inference on independent conformal calibration split
+    # ------------------------------------------------------------------
+    print(f"[5/10] Inference on conformal calibration split ({cal_size} samples)...")
     t0 = time.time()
     cal_logits, _ = collect_logits(
         model, cal_dataset, args.batch_size, device, args.num_workers
     )
-    cal_probs_raw = F.softmax(cal_logits, dim=1)
     print(f"  done in {time.time() - t0:.1f}s")
 
     # ------------------------------------------------------------------
-    # 7. Run inference on evaluation split
+    # 8. Run inference on evaluation split
     # ------------------------------------------------------------------
-    print(f"[5/10] Inference on evaluation split ({eval_size} samples)...")
+    print(f"[6/10] Inference on evaluation split ({eval_size} samples)...")
     t0 = time.time()
     eval_logits, _ = collect_logits(
         model, eval_dataset, args.batch_size, device, args.num_workers
@@ -419,11 +534,11 @@ def main() -> None:
     print(f"  done in {time.time() - t0:.1f}s")
 
     # ------------------------------------------------------------------
-    # 8. Temperature scaling
+    # 9. Temperature scaling, fitted independently of conformal/eval labels
     # ------------------------------------------------------------------
-    print("[6/10] Fitting temperature scaling on calibration logits...")
+    print("[7/10] Fitting temperature scaling on its separate split...")
     scaler = TemperatureScaler()
-    T = scaler.fit(cal_logits, cal_labels)
+    T = scaler.fit(temperature_logits, temperature_labels)
     print(f"  fitted T = {T:.4f}")
 
     eval_probs_scaled = F.softmax(scaler(eval_logits), dim=1)
@@ -432,7 +547,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 9. ECE comparison
     # ------------------------------------------------------------------
-    print("[7/10] ECE on evaluation split:")
+    print("[8/10] ECE on evaluation split:")
     ece_raw = expected_calibration_error(eval_probs_raw, eval_labels)
     ece_scaled = expected_calibration_error(eval_probs_scaled, eval_labels)
     print(f"  Raw ECE:      {ece_raw:.4f}")
@@ -442,7 +557,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 10. Conformal prediction
     # ------------------------------------------------------------------
-    print(f"[8/10] Conformal prediction (alpha={args.alpha}, target coverage={1 - args.alpha:.1%}):")
+    print(f"[9/10] Conformal prediction (alpha={args.alpha}, target coverage={1 - args.alpha:.1%}):")
     # Fit on calibration probabilities (scaled)
     conformal_q = fit_conformal_quantile(cal_probs_scaled, cal_labels, alpha=args.alpha)
     print(f"  Calibrated quantile q = {conformal_q:.4f}")
@@ -474,7 +589,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 11. Abstention analysis
     # ------------------------------------------------------------------
-    print("[9/10] Abstention analysis:")
+    print("[10/10] Abstention analysis:")
     abstention_results = {}
     for thr in args.threshold:
         should_pred = abstention_mask(eval_probs_scaled, threshold=thr)
@@ -514,8 +629,11 @@ def main() -> None:
               f"(abstention rate={abstention_rate:.1%})")
         print(f"    accuracy-when-predicting = {acc_when_predicting:.4f}")
         print(f"    coverage = {coverage_thr:.4f}")
-        print(f"    mean_km = {dists_pred['mean_km']:.1f} km, "
-              f"median_km = {dists_pred['median_km']:.1f} km")
+        if dists_pred["n"]:
+            print(f"    mean_km = {dists_pred['mean_km']:.1f} km, "
+                  f"median_km = {dists_pred['median_km']:.1f} km")
+        else:
+            print("    mean_km = n/a, median_km = n/a (no predictions retained)")
         print(f"    within 1km={dists_pred['within_1km']:.1f}%, "
               f"25km={dists_pred['within_25km']:.1f}%, "
               f"200km={dists_pred['within_200km']:.1f}%")
@@ -528,6 +646,18 @@ def main() -> None:
         eval_true_lats, eval_true_lons,
     )
 
+    regional_metrics = spatial_stratified_metrics(
+        eval_probs_scaled.detach().cpu().tolist(),
+        eval_labels.tolist(),
+        csets.detach().cpu().tolist(),
+        eval_true_lats.tolist(),
+        eval_true_lons.tolist(),
+        centroids.tolist(),
+        lat_bands=args.region_lat_bands,
+        lon_bands=args.region_lon_bands,
+        min_count=args.region_min_count,
+    )
+
     # ------------------------------------------------------------------
     # Build results dict
     # ------------------------------------------------------------------
@@ -536,18 +666,48 @@ def main() -> None:
         "csv": str(csv_path),
         "seed": args.seed,
         "n_total": n_total,
+        "n_temperature_fit": temperature_size,
         "n_calibration": cal_size,
         "n_evaluation": eval_size,
+        "configuration": {
+            "seed": args.seed,
+            "alpha": args.alpha,
+            "abstention_thresholds": args.threshold,
+            "temperature_size": temperature_size,
+            "calibration_size": cal_size,
+            "evaluation_size": eval_size,
+            "batch_size": args.batch_size,
+            "image_size": args.image_size,
+            "num_workers": args.num_workers,
+            "device": str(device),
+        },
         "calibration_note": (
-            f"First {cal_size} rows of the official OSV test CSV are used for "
-            f"calibration (temperature scaling + conformal threshold fitting). "
-            f"The remaining {eval_size} rows are used for final L3 evaluation."
+            f"A seeded random sample of {temperature_size} rows fits temperature; "
+            f"a separate {cal_size}-row sample fits the conformal threshold; "
+            f"the other {eval_size} rows are evaluation-only. The split manifest "
+            "records exact indices, sample IDs, and input hashes."
         ),
+        "split_manifest": split_provenance,
+        "provenance": {
+            "csv_sha256": split_provenance["csv_sha256"],
+            "checkpoint_sha256": split_provenance["checkpoint_sha256"],
+            "split_sha256": split_provenance["split_sha256"],
+            "software_versions": {
+                "python": sys.version.split()[0],
+                "torch": torch.__version__,
+                "numpy": np.__version__,
+                "pandas": _distribution_version("pandas"),
+                "Pillow": _distribution_version("Pillow"),
+                "torchvision": _distribution_version("torchvision"),
+            },
+            "repository_revision": _repository_revision(),
+            "working_tree_dirty": _repository_dirty(),
+        },
         "num_cells": num_cells,
         "device": str(device),
         "temperature": T,
         "alpha": args.alpha,
-        "conformal_quantile": conformal_q,
+        "conformal_quantile": conformal_q if math.isfinite(conformal_q) else "Infinity",
         "ece": {
             "raw": ece_raw,
             "scaled": ece_scaled,
@@ -565,6 +725,7 @@ def main() -> None:
             for thr in args.threshold
         },
         "full_eval": dists_full,
+        "regional_evaluation": regional_metrics,
         "temperature_fitted_T": T,
     }
 
@@ -576,7 +737,8 @@ def main() -> None:
     print("L3 UNCERTAINTY RESULTS SUMMARY")
     print("=" * 72)
     print(f"  Checkpoint:    {ckpt_path.name}")
-    print(f"  Calibration:   {cal_size} samples (withheld from eval)")
+    print(f"  Temperature:   {temperature_size} samples (temperature fitting only)")
+    print(f"  Calibration:   {cal_size} separate samples (conformal fitting only)")
     print(f"  Evaluation:    {eval_size} samples")
     print(f"  Temperature:   T = {T:.4f}")
     print(f"  ECE (raw):     {ece_raw:.4f}")
@@ -586,13 +748,24 @@ def main() -> None:
     print(f"  Mean set size: {mean_set_size:.2f}")
     for thr in args.threshold:
         r = abstention_results[thr]
+        mean_km = r["distances"]["mean_km"]
+        mean_km_text = "n/a" if mean_km is None else f"{mean_km:.1f}"
         print(f"  Abstain@{thr:.2f}:  rate={r['abstention_rate']:.1%}, "
               f"acc={r['accuracy_when_predicting']:.4f}, "
-              f"mean_km={r['distances']['mean_km']:.1f}")
+              f"mean_km={mean_km_text}")
     print(f"  Full eval:     within 1km={dists_full['within_1km']:.1f}%, "
           f"25km={dists_full['within_25km']:.1f}%, "
           f"200km={dists_full['within_200km']:.1f}%")
     print(f"  Mean dist:     {dists_full['mean_km']:.1f} km")
+    reported_regions = sum(
+        region["metrics"] is not None
+        for region in regional_metrics["regions"].values()
+    )
+    print(
+        f"  Regional metrics: {reported_regions}/"
+        f"{len(regional_metrics['regions'])} occupied regions meet n="
+        f"{args.region_min_count}"
+    )
     print("=" * 72)
 
     # ------------------------------------------------------------------
@@ -619,6 +792,39 @@ def _json_default(obj):
     if isinstance(obj, float) and (obj != obj):  # NaN
         return "NaN"
     raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+
+
+def _repository_revision() -> str | None:
+    """Return the current Git revision when the run is inside a checkout."""
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def _repository_dirty() -> bool | None:
+    """Report whether tracked/untracked files differ from the recorded revision."""
+    try:
+        status = subprocess.check_output(
+            ["git", "-C", str(ROOT), "status", "--porcelain"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        return bool(status.strip())
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def _distribution_version(distribution: str) -> str | None:
+    """Return an installed package version without importing the package."""
+    try:
+        return importlib.metadata.version(distribution)
+    except importlib.metadata.PackageNotFoundError:
+        return None
 
 
 if __name__ == "__main__":

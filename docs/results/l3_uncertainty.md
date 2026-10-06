@@ -10,12 +10,14 @@ L3 was evaluated with the selected L2 checkpoint:
 - 300 fixed geographic cells
 - checkpoint: `checkpoints/l2_imagenet_1.0_layer4/last.pt`
 
-The 3,000-row official OSV test CSV was split deterministically: the first
-1,000 rows were used only for temperature and conformal calibration, and the
-remaining 2,000 rows were used for evaluation. This makes the reported L3
-metrics comparable within this experiment, but the evaluation is not an
-entirely untouched 3,000-row test score because calibration consumed part of
-the official test file.
+These are historical upstream results, produced before this fork's split
+protocol change. The original run used the first 1,000 CSV rows for both
+temperature fitting and conformal threshold fitting, then evaluated on the
+remaining 2,000 rows. Because the calibration threshold used examples that
+also fitted the temperature, these results should be treated as descriptive,
+not as a fresh split-conformal evaluation. The original sample order was also
+not randomized. The fork's three-way harness must be rerun with the matching
+data and checkpoint before reporting new evaluation results.
 
 ## Results
 
@@ -34,6 +36,9 @@ the official test file.
 | Mean evaluation distance | 6,041 km |
 
 ## Interpretation
+
+The metrics below are retained as upstream historical measurements and are
+not results of this contribution.
 
 Temperature scaling substantially improves calibration, meeting the L3 ECE
 target. Split-conformal prediction reaches the requested 90% coverage, but

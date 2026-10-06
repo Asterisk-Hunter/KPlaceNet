@@ -14,6 +14,7 @@ References:
 
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 import torch
@@ -183,33 +184,64 @@ def fit_conformal_quantile(
     """Fit a conformal quantile threshold from calibration data.
 
     Uses the nonconformity score ``s_i = 1 - p_i[y_i]`` (probability of the
-    true class).  The threshold ``q`` is the ``(1 - alpha)``-quantile of these
-    scores, adjusted for finite-sample finite-sample coverage guarantee:
-
-        ``q = quantile(s, ceil((n+1)(1-alpha)) / n)``
-
-    (Angelandopoulos & Bates 2023, Eq. 3.3).  This ensures
-    ``P(Y_{n+1} in C) >= 1 - alpha`` for exchangeable data.
+    true class). Let ``k = ceil((n + 1) * (1 - alpha))``. The threshold is the
+    *k-th smallest observed score*, not a linearly interpolated quantile. If
+    ``k > n``, it is ``+inf`` (the conservative finite-sample convention).
+    Under exchangeability of calibration and future examples this gives
+    marginal coverage at least ``1 - alpha`` (Angelopoulos & Bates, 2023,
+    Eq. 3.3). This guarantee does not imply conditional or region-wise
+    coverage, and need not hold under geographic distribution shift.
 
     Args:
         probs_cal: (N, K) softmax probabilities on calibration set.
         labels_cal: (N,) ground-truth labels for calibration set.
-        alpha: miscoverage rate; target coverage = 1 - alpha (default 0.1).
+        alpha: miscoverage rate, strictly between 0 and 1 (default 0.1).
 
     Returns:
         Quantile threshold ``q`` as a float.  Use with ``conformal_prediction_set``.
     """
+    if probs_cal.ndim != 2 or probs_cal.shape[1] == 0:
+        raise ValueError("probs_cal must have shape (N, K) with K > 0")
+    if labels_cal.ndim != 1 or labels_cal.shape[0] != probs_cal.shape[0]:
+        raise ValueError("labels_cal must have shape (N,) matching probs_cal")
+    if probs_cal.shape[0] == 0:
+        raise ValueError("calibration data must contain at least one example")
+    if labels_cal.dtype == torch.bool or labels_cal.is_floating_point() or labels_cal.is_complex():
+        raise ValueError("labels_cal must contain integer class indices")
+    try:
+        alpha = float(alpha)
+    except (TypeError, ValueError) as error:
+        raise ValueError("alpha must be a finite number strictly between 0 and 1") from error
+    if not torch.isfinite(torch.tensor(alpha)) or not 0.0 < alpha < 1.0:
+        raise ValueError("alpha must be a finite number strictly between 0 and 1")
+
     probs_cal = probs_cal.float()
-    labels_cal = labels_cal.long()
+    labels_cal = labels_cal.to(device=probs_cal.device, dtype=torch.long)
+    if not torch.isfinite(probs_cal).all():
+        raise ValueError("probs_cal must contain only finite values")
+    if ((probs_cal < 0) | (probs_cal > 1)).any():
+        raise ValueError("probs_cal values must be in [0, 1]")
+    if not torch.allclose(
+        probs_cal.sum(dim=1),
+        torch.ones(probs_cal.shape[0], device=probs_cal.device),
+        rtol=1e-5,
+        atol=1e-6,
+    ):
+        raise ValueError("each row of probs_cal must sum to 1")
 
     n = probs_cal.shape[0]
+    if (labels_cal < 0).any() or (labels_cal >= probs_cal.shape[1]).any():
+        raise ValueError("labels_cal contains a class index outside probs_cal")
     # Nonconformity: 1 - prob of true class
-    true_probs = probs_cal[torch.arange(n), labels_cal]
+    true_probs = probs_cal[torch.arange(n, device=probs_cal.device), labels_cal]
     scores = 1.0 - true_probs
 
-    # Finite-sample quantile: ceil((n+1)(1-alpha)) / n
-    quantile_level = min(1.0, (n + 1) * (1.0 - alpha) / n)
-    q = float(torch.quantile(scores, quantile_level).item())
+    # Split-conformal finite-sample order statistic. torch.quantile's default
+    # linear interpolation does not implement the required discrete rank.
+    rank = math.ceil((n + 1) * (1.0 - alpha))
+    if rank > n:
+        return float("inf")
+    q = float(torch.kthvalue(scores, rank).values.item())
 
     return q
 

@@ -138,6 +138,20 @@ L3 adds post-hoc uncertainty calibration to the L2 winner (`l2_imagenet_1.0_laye
 temperature scaling (Guo et al. 2017), split-conformal prediction sets, and
 confidence-based abstention.
 
+### Fork contribution
+
+This fork corrects the finite-sample conformal cutoff to use the discrete
+order statistic `k = ceil((n + 1) * (1 - alpha))`; when `k > n`, the
+conservative threshold is infinity. L3 now uses three disjoint seeded
+partitions: temperature fitting, conformal calibration, and evaluation. Its
+JSON artifact records split indices and sample IDs, CSV/checkpoint hashes,
+all inference configuration, relevant software versions, repository
+revision, and dirty-tree status. Empty abstention subsets are represented as
+missing distances rather than nonstandard JSON `NaN`. These changes make the
+protocol auditable; they do not establish exchangeability or regional
+coverage under geographic shift. The upstream L3 numbers below remain
+historical and are not measurements of this fork's changes.
+
 ### Quick Start — Plan-Only (no GPU, no images loaded)
 
 ```powershell
@@ -152,8 +166,9 @@ python scripts/run_l3_uncertainty.py --calibration-size 500 --alpha 0.05
 
 ```powershell
 # Run L3 on the selected checkpoint with default settings
-#   - Calibration: first 1000 rows of OSV test (withheld from eval)
-#   - Evaluation:  remaining 2000 rows
+#   - Temperature fit: 500 seeded random OSV-test rows
+#   - Conformal calibration: separate 1000 seeded random rows
+#   - Evaluation: remaining 1500 rows
 #   - Temperature scaling + conformal + abstention analysis
 python scripts/run_l3_uncertainty.py --run
 
@@ -161,13 +176,25 @@ python scripts/run_l3_uncertainty.py --run
 python scripts/run_l3_uncertainty.py --run --alpha 0.05 --threshold 0.3 0.5 0.7
 ```
 
-> **Calibration caveat:** The first 1000 examples of the official OSV test subset
-> (`data/osv5m_test/metadata.csv`) are used as the calibration split for both
-> temperature scaling and conformal threshold fitting.  These 1000 examples are
-> **withheld** from all final L3 evaluation metrics (ECE, coverage, abstention,
-> distance).  Only the remaining 2000 examples are used for final evaluation.
-> This is a deterministic split (rows 0–999 = calibration, 1000–2999 = eval)
-> controlled by `--seed`.
+> **Calibration caveat:** The L3 run uses three disjoint seeded partitions of
+> the official OSV test subset (`data/osv5m_test/metadata.csv`): 500 rows fit
+> temperature, a separate 1000 rows fit the conformal threshold, and the
+> remaining 1500 rows are evaluation-only. The generated results JSON records
+> exact indices, stable sample IDs, CSV and checkpoint SHA-256 hashes, library
+> versions, and a split hash. The finite-sample conformal statement is marginal
+> and requires calibration and future examples to be exchangeable. Random row
+> splitting does not establish geographic exchangeability, guarantee regional
+> coverage, or provide a guarantee under geographic distribution shift.
+
+The run also reports empirical coverage, mean prediction-set size, top-1
+accuracy, and geodesic-distance thresholds by occupied equal-area grid region.
+Latitude bands are uniform in `sin(latitude)` and longitude bands are uniform,
+so grid cells have approximately equal spherical area. Regions below the
+minimum count remain in the JSON artifact with `metrics: null`; reported
+coverage includes a 95% Wilson interval. These are descriptive diagnostics,
+not conditional coverage guarantees, and the intervals do not correct for
+spatial dependence. Configure the grid with `--region-lat-bands`,
+`--region-lon-bands`, and `--region-min-count`.
 
 ## L4 — Adaptive Cell Construction (Gap 1)
 

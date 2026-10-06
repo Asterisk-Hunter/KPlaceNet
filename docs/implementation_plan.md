@@ -22,6 +22,17 @@
 
 **Anti-deviation rule:** No new dataset, no new backbone, no text/temporal fusion, no mobile/ONNX, no cross-view satellite, no full OSV-5M until L1-L4 exit gates are met.
 
+### Authorized fork addendum (2026-10-06)
+
+For the fork contribution, L3 may additionally report descriptive evaluation
+metrics by an equal-area latitude/longitude grid: sample count, top-1 accuracy,
+conformal coverage with a Wilson interval, prediction-set size, and geodesic
+distance thresholds. This is evaluation-only; it adds no dataset, backbone, or
+training objective and makes no claim of regional coverage. Sparse regions
+remain visible but omit rates below the configured sample-count floor. The
+interval does not account for spatial dependence, and marginal split-conformal
+coverage does not imply conditional or region-wise coverage.
+
 ## 2. Dataset Strategy (4050-safe)
 
 | Phase | Dataset | Size | Purpose |
