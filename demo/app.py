@@ -198,8 +198,15 @@ def build_ui():
     fn = build_predict_fn()
 
     def _gradio_fn(img):
+        import matplotlib.pyplot as plt
+        import numpy as np
+
         d = fn(img)
-        return d["figure"], _format_markdown(d)
+        fig = d["figure"]
+        fig.canvas.draw()
+        arr = np.asarray(fig.canvas.buffer_rgba())[..., :3].copy()
+        plt.close(fig)
+        return arr, _format_markdown(d)
 
     with gr.Blocks(title="KPlaceNet demo") as demo:
         gr.Markdown("# KPlaceNet demo — coarse photo geolocation")

@@ -241,3 +241,13 @@ python demo/app.py
 ```
 
 Upload a photo → global + zoomed (+/-5 deg) matplotlib map of the predicted cell, plus calibrated vs raw confidence, temperature T, conformal set size, and an ACCEPT / ABSTAIN verdict. Haversine distance is only measurable on the labeled test set (no ground truth for uploads).
+
+### GeoGuessr game (`demo/geoguessr.py`, recommended)
+
+You-vs-model game on the 3,000-image OSV test set: a mystery photo appears, you set lat/lon sliders and **Lock guess** (snapped to the nearest of the 300 model regions shown as dots on a real country map), then **Reveal** scores truth vs model vs you in km and GeoGuessr-style points (5000 at 0 km, exponential decay). Needs `plotly` (`python -m pip install plotly`).
+
+```powershell
+python demo/geoguessr.py
+```
+
+Headless full probe (no server): `python -c "from demo.geoguessr import selftest; selftest()"` — covers no-leakage pre-reveal, scoring math, idempotent reveal, invalid/corrupt inputs.
