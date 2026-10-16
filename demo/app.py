@@ -222,6 +222,24 @@ def build_ui():
         with gr.Row():
             img_in = gr.Image(type="pil", label="Upload photo")
             map_out = gr.Plot(label="Predicted location map")
+        gr.Examples(
+            examples=[
+                str((ROOT / "data" / "osv5m_test" / "images" / f).resolve())
+                for f in [
+                    # Rajasthan desert hits: 13 / 29 / 38 km error (model at its best)
+                    "3002826110043032.jpg",
+                    "271239751462351.jpg",
+                    "294463115640123.jpg",
+                    # Honest failure: Kerala photo, ~690 km miss (model rightly abstains)
+                    "758042071550066.jpg",
+                    # Global hits: UK 12 km, Ecuador 14 km
+                    "905946183585986.jpg",
+                    "1472138156457085.jpg",
+                ]
+            ],
+            inputs=img_in,
+            label="Curated test photos (known outcomes — safe for presentations)",
+        )
         info_out = gr.Markdown(label="Prediction details")
         img_in.change(fn=_gradio_fn, inputs=img_in, outputs=[map_out, info_out])
     return demo
