@@ -1,7 +1,7 @@
 """KPlaceNet interactive demo (single file).
 
 L2 winner (l2_imagenet_1.0_layer4) + L3 calibration (temperature + conformal).
-Lazy model load, one-image inference, matplotlib global + zoom map.
+Lazy model load, one-image inference, plotly world map (real countries).
 """
 
 from __future__ import annotations
@@ -10,10 +10,7 @@ import json
 import sys
 from pathlib import Path
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle
+import plotly.graph_objects as go
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -90,36 +87,49 @@ def _load_resources():
     return _CACHE
 
 
-def render_map(lat: float, lon: float, cell) -> "plt.Figure":
-    """Panel A: global equirectangular + Panel B: +/-5 deg zoom."""
-    plt.close("all")  # avoid figure accumulation across repeated calls
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    for ax, title, x0, x1, y0, y1 in [
-        (axes[0], "Global prediction", -180, 180, -90, 90),
-        (axes[1], "Zoom (+/-5 deg)", max(-180, lon - 5), min(180, lon + 5),
-         max(-90, lat - 5), min(90, lat + 5)),
-    ]:
-        ax.set_xlim(x0, x1)
-        ax.set_ylim(y0, y1)
-        ax.set_xlabel("lon")
-        ax.set_ylabel("lat")
-        ax.set_title(title)
-        ax.set_xticks(range(-180, 181, 30))
-        ax.set_yticks(range(-90, 91, 30))
-        ax.grid(True, linewidth=0.4, alpha=0.7)
-        # Cell bounding box (skip if degenerate zero box).
-        if not (cell.lat_min == 0 and cell.lat_max == 0
-                and cell.lon_min == 0 and cell.lon_max == 0):
-            w = cell.lon_max - cell.lon_min
-            h = cell.lat_max - cell.lat_min
-            if w > 0 and h > 0:
-                ax.add_patch(Rectangle((cell.lon_min, cell.lat_min), w, h,
-                                       fill=False, linewidth=1.5))
-        ax.plot(lon, lat, marker="*", markersize=12)
-        ax.text(lon, lat, f"  {lat:.2f}, {lon:.2f}", fontsize=8,
-                va="bottom", ha="left")
-    fig.tight_layout()
-    return fig  # caller (gradio) owns lifecycle; plt.close("all") on next call
+def render_map(lat: float, lon: float, cell):
+    """World map with real countries: 300 region dots + cell box + prediction star."""
+    res = _load_resources()
+    traces = [go.Scattergeo(
+        lat=[float(c.centroid_lat) for c in res["cells"]],
+        lon=[float(c.centroid_lon) for c in res["cells"]],
+        mode="markers",
+        marker={"size": 3, "color": "rgba(30,144,255,0.45)"},
+        name="300 model regions",
+        hovertemplate="cell %{customdata}<extra></extra>",
+        customdata=[int(c.cell_id) for c in res["cells"]],
+    )]
+    # Predicted cell bounding box as a red outline (skip if degenerate).
+    if (cell.lon_max - cell.lon_min) > 0 and (cell.lat_max - cell.lat_min) > 0:
+        box_lon = [cell.lon_min, cell.lon_max, cell.lon_max, cell.lon_min, cell.lon_min]
+        box_lat = [cell.lat_min, cell.lat_min, cell.lat_max, cell.lat_max, cell.lat_min]
+        traces.append(go.Scattergeo(
+            lat=[float(v) for v in box_lat], lon=[float(v) for v in box_lon],
+            mode="lines", line={"width": 2, "color": "red"},
+            name=f"cell {cell.cell_id} box",
+        ))
+    traces.append(go.Scattergeo(
+        lat=[float(lat)], lon=[float(lon)],
+        mode="markers", marker={"size": 14, "color": "red", "symbol": "star"},
+        name=f"predicted {float(lat):.2f},{float(lon):.2f}",
+    ))
+    return go.Figure(
+        data=traces,
+        layout={
+            "geo": {
+                "scope": "world",
+                "projection": {"type": "equirectangular"},
+                "showland": True, "landcolor": "rgb(235,235,220)",
+                "showocean": True, "oceancolor": "rgb(200,225,245)",
+                "showcountries": True, "countrycolor": "rgb(150,150,150)",
+                "coastlinecolor": "rgb(120,120,120)", "showframe": True,
+            },
+            "margin": {"l": 0, "r": 0, "t": 30, "b": 0},
+            "title": f"Model prediction — cell {cell.cell_id} "
+                      f"({float(lat):.2f}, {float(lon):.2f})",
+            "showlegend": True,
+        },
+    )
 
 
 def predict_one(image):
@@ -198,15 +208,8 @@ def build_ui():
     fn = build_predict_fn()
 
     def _gradio_fn(img):
-        import matplotlib.pyplot as plt
-        import numpy as np
-
         d = fn(img)
-        fig = d["figure"]
-        fig.canvas.draw()
-        arr = np.asarray(fig.canvas.buffer_rgba())[..., :3].copy()
-        plt.close(fig)
-        return arr, _format_markdown(d)
+        return d["figure"], _format_markdown(d)
 
     with gr.Blocks(title="KPlaceNet demo") as demo:
         gr.Markdown("# KPlaceNet demo — coarse photo geolocation")
@@ -218,7 +221,7 @@ def build_ui():
         )
         with gr.Row():
             img_in = gr.Image(type="pil", label="Upload photo")
-            map_out = gr.Image(label="Predicted location map")
+            map_out = gr.Plot(label="Predicted location map")
         info_out = gr.Markdown(label="Prediction details")
         img_in.change(fn=_gradio_fn, inputs=img_in, outputs=[map_out, info_out])
     return demo
